@@ -5430,6 +5430,14 @@ impl Pager {
 
     fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::default();
+        // A `PendingRead` is a disk read that yielded on spill before it could
+        // reach the page cache, memoized so the re-entry does not issue the IO
+        // twice. It belongs to the transaction that started it. Left behind by a
+        // transaction that ends instead of re-entering, it outlives the page it
+        // names: the next `read_page` for that page id takes the memoized
+        // `PageRef` and never consults the cache, so it hands out a stale page
+        // and then collides with the live one on insert.
+        self.pending_reads.write().clear();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
@@ -6150,6 +6158,49 @@ mod ptrmap_tests {
             pager.pending_reads.read().get(&target_idx).is_none(),
             "pending_reads entry must be cleared once read_page_nonblock returns Done"
         );
+    }
+
+    /// A `PendingRead` belongs to the transaction that started it, so ending
+    /// that transaction must discard it rather than leave it for whoever reads
+    /// the page next.
+    ///
+    /// The entry short-circuits `read_page` ahead of the cache lookup, which is
+    /// the point during a spill re-entry and exactly wrong once the transaction
+    /// is over: a later reader is handed the memoized `PageRef` without
+    /// consulting the cache, and then trips `Attempted to insert different page
+    /// with same key` inserting that stale page over the live one. A failed MVCC
+    /// checkpoint is one way to get there, since it can abandon a spill-yielded
+    /// read and later retry the same pages on the same pager.
+    #[test]
+    fn ending_a_transaction_discards_its_pending_reads() {
+        let pager = test_pager_setup(4096, 10);
+
+        let target_idx: i64 = 9999;
+        let abandoned: PageRef = Arc::new(Page::new(target_idx));
+        abandoned.set_loaded();
+        pager.pending_reads.write().insert(
+            target_idx,
+            PendingRead {
+                page: abandoned.clone(),
+                disk_read: Some(Completion::new_yield()),
+            },
+        );
+
+        pager.reset_internal_states();
+
+        assert!(
+            pager.pending_reads.read().is_empty(),
+            "ending a transaction must discard the reads it had in flight"
+        );
+
+        // And the abandoned PageRef must no longer be what a later read returns.
+        let res = pager.read_page(target_idx);
+        if let Ok(IOResult::Done((page, _))) = res {
+            assert!(
+                !Arc::ptr_eq(&page, &abandoned),
+                "a later read must not be handed the abandoned page"
+            );
+        }
     }
 }
 
