@@ -172,6 +172,13 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Tables or indexes that were created in this checkpoint
     /// key is the rowid in the sqlite_schema table
     created_btrees: HashMap<i64, (MVTableId, RowVersion)>,
+    /// Every `table_id_to_rootpage` entry this attempt has changed, paired
+    /// with the value it held before. The map is shared MvStore state, but
+    /// the root pages written into it are allocated inside this checkpoint's
+    /// pager transaction, so they only exist if that transaction commits.
+    /// Cleanup replays this in reverse so a failed attempt cannot leave the
+    /// store pointing at pages the rollback took away.
+    rootpage_mutations: Vec<(MVTableId, Option<Option<u64>>)>,
     /// Tables that were destroyed in this checkpoint
     destroyed_tables: HashSet<MVTableId>,
     /// Indexes that were destroyed in this checkpoint
@@ -671,6 +678,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             delete_row_state_machine: None,
             cursors: HashMap::default(),
             created_btrees: HashMap::default(),
+            rootpage_mutations: Vec::new(),
             destroyed_tables: HashSet::default(),
             destroyed_indexes: HashSet::default(),
             index_write_set: Vec::new(),
@@ -702,6 +710,54 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         )
     }
 
+    /// Remember what `table_id_to_rootpage` held for `table_id` before this
+    /// attempt changes it, so a failed attempt can put it back. Takes the two
+    /// fields it needs rather than `&mut self`, because the call sites are
+    /// inside iterations that already borrow the store.
+    fn record_rootpage_mutation(
+        mvstore: &MvStore<Clock, A>,
+        mutations: &mut Vec<(MVTableId, Option<Option<u64>>)>,
+        table_id: MVTableId,
+    ) {
+        // `None` here means the map had no entry at all, which is not the
+        // same as an entry holding `None` — restoring the second with a removal
+        // would also drop the table's last-rowid watermark.
+        let previous = mvstore
+            .table_id_to_rootpage
+            .get(&table_id)
+            .map(|entry| *entry.value());
+        mutations.push((table_id, previous));
+    }
+
+    /// Put every `table_id_to_rootpage` entry this attempt changed back the way
+    /// it was, newest first.
+    ///
+    /// A checkpoint materializes a b-tree by allocating its root page inside
+    /// its own pager write transaction and publishing that page number into the
+    /// MvStore immediately (`BTreeCreate` / `BTreeCreateIndex`). The page only
+    /// becomes real when that transaction commits. If the checkpoint fails, the
+    /// rollback takes the page away while the published mapping survives in
+    /// shared state, and every later read of that table resolves to a page past
+    /// the end of the file: short reads, out-of-bounds cell-pointer walks, and
+    /// b-tree pages whose type byte is garbage. Drops (`BTreeDestroy` and the
+    /// never-checkpointed DROP paths) remove a mapping that is likewise only
+    /// durable once the attempt commits.
+    fn restore_rootpage_mutations(&mut self) {
+        for (table_id, previous) in self.rootpage_mutations.drain(..).rev() {
+            match previous {
+                Some(root_page) => {
+                    crate::without_allocation_faults!(self
+                        .mvstore
+                        .insert_table_id_to_rootpage(table_id, root_page)
+                        .expect(crate::alloc::ALLOC_ERR_MSG));
+                }
+                None => {
+                    self.mvstore.remove_table_id_to_rootpage(&table_id);
+                }
+            }
+        }
+    }
+
     /// Cleanup path for I/O errors that happen while waiting on completions outside
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
@@ -723,6 +779,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             self.lock_states.pager_read_tx = false;
         }
+
+        // The pager transaction is gone, so the root pages it allocated are gone
+        // with it. Publishing them into the MvStore is not conditional on the
+        // commit, so undoing it has to be.
+        self.restore_rootpage_mutations();
 
         // MVCC checkpointing drives WAL checkpoint directly; on errors we must
         // explicitly reset both pager and WAL checkpoint states.
@@ -891,6 +952,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     // No BTreeDestroyIndex needed since there's no physical B-tree.
                                     let index_id = MVTableId(root_page);
                                     self.destroyed_indexes.insert(index_id);
+                                    Self::record_rootpage_mutation(
+                                        &self.mvstore,
+                                        &mut self.rootpage_mutations,
+                                        index_id,
+                                    );
                                     self.mvstore.remove_table_id_to_rootpage(&index_id);
                                     skip_write = true;
                                 } else {
@@ -950,6 +1016,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     // No BTreeDestroy needed since there's no physical B-tree.
                                     let table_id = MVTableId::from(root_page);
                                     self.destroyed_tables.insert(table_id);
+                                    Self::record_rootpage_mutation(
+                                        &self.mvstore,
+                                        &mut self.rootpage_mutations,
+                                        table_id,
+                                    );
                                     self.mvstore.remove_table_id_to_rootpage(&table_id);
                                     skip_write = true;
                                 } else {
@@ -1606,6 +1677,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 self.pager.btree_create(&CreateBTreeFlags::new_table())
                             })?;
                             // TODO: If this allocation fails, we would have created a Btree here that is dangling, see later how we should handle this error
+                            Self::record_rootpage_mutation(
+                                &self.mvstore,
+                                &mut self.rootpage_mutations,
+                                table_id,
+                            );
                             crate::without_allocation_faults!(self
                                 .mvstore
                                 .insert_table_id_to_rootpage(
@@ -1649,6 +1725,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
+                            Self::record_rootpage_mutation(
+                                &self.mvstore,
+                                &mut self.rootpage_mutations,
+                                table_id,
+                            );
                             self.mvstore.remove_table_id_to_rootpage(&table_id);
                         }
                         SpecialWrite::BTreeCreateIndex { index_id, .. } => {
@@ -1656,6 +1737,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 self.pager.btree_create(&CreateBTreeFlags::new_index())
                             })?;
                             // TODO: If this allocation fails, we would have created a Btree here that is dangling, see later how we should handle this error
+                            Self::record_rootpage_mutation(
+                                &self.mvstore,
+                                &mut self.rootpage_mutations,
+                                index_id,
+                            );
                             crate::without_allocation_faults!(self
                                 .mvstore
                                 .insert_table_id_to_rootpage(
@@ -1715,6 +1801,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
+                            Self::record_rootpage_mutation(
+                                &self.mvstore,
+                                &mut self.rootpage_mutations,
+                                index_id,
+                            );
                             self.mvstore.remove_table_id_to_rootpage(&index_id);
                         }
                     }
@@ -2134,6 +2225,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         self.state = CheckpointState::CheckpointWal;
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
+                        // The pager transaction that allocated these root pages
+                        // has committed, so the published mappings are durable
+                        // and a failure in a later stage must not undo them.
+                        self.rootpage_mutations.clear();
                         // Publish the exact page-1 snapshot that was staged into the pager txn.
                         let header = self.staged_checkpoint_header.take().ok_or_else(|| {
                             LimboError::InternalError(

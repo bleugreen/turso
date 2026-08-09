@@ -3142,6 +3142,91 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
+/// What this test checks: a checkpoint that fails while materializing new b-trees must not
+/// leave the MvStore pointing at the root pages it allocated, because the pager transaction
+/// that allocated them is rolled back with the failure.
+///
+/// `BTreeCreate` / `BTreeCreateIndex` allocate a root page inside the checkpoint's own pager
+/// write transaction and publish it into `table_id_to_rootpage` immediately, which is shared
+/// MvStore state. Nothing used to undo that publication when the attempt failed, so every later
+/// read of one of those tables resolved to a page past the end of the database file. Depending
+/// on what the file and cache happened to hold, that surfaced as a short read, an out-of-bounds
+/// cell-pointer walk, or a b-tree page whose type byte was garbage.
+///
+/// The failure here is the one that happens in practice: a page cache too small for the
+/// checkpoint's working set. The checkpoint holds a cursor per b-tree, each pinning pages that
+/// cannot then be evicted, so a schema with many b-trees and a floor-sized cache reaches a page
+/// it cannot admit and gives up part-way through.
+///
+/// Steps:
+/// 1. With auto-checkpoint off and the smallest cache the engine allows, create many tables and
+///    indexes and write rows to all of them, so one checkpoint must materialize every b-tree.
+/// 2. Let a commit fire the auto-checkpoint. It fails, and the commit must swallow that.
+/// 3. Every table must still read correctly: before the fix, this hit the dangling root pages.
+/// 4. Give the connection a cache that can finish, and check the retry succeeds and the data is
+///    all there — the failed attempt must have left a state a later checkpoint can complete.
+#[test]
+fn test_failed_checkpoint_does_not_publish_rootpages_it_rolled_back() {
+    const TABLES: usize = 130;
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA cache_size = -1").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for n in 0..TABLES {
+        conn.execute(format!("CREATE TABLE t{n}(id INTEGER PRIMARY KEY, v BLOB)"))
+            .unwrap();
+        conn.execute(format!("CREATE INDEX idx_t{n} ON t{n}(v)"))
+            .unwrap();
+    }
+    for round in 0..8 {
+        for n in 0..TABLES {
+            conn.execute(format!(
+                "INSERT INTO t{n} VALUES ({round}, randomblob(400))"
+            ))
+            .unwrap();
+        }
+    }
+
+    // One commit, one auto-checkpoint attempt, which cannot finish in this cache.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+        .unwrap();
+    conn.execute("INSERT INTO t0 VALUES (9999, randomblob(400))")
+        .expect("an auto-checkpoint failure must not surface to the committing statement");
+
+    // Every table still reads. The rows live in the MV store either way; what the
+    // failed attempt must not have done is repoint the store at pages that the
+    // rollback took back.
+    for n in 0..TABLES {
+        let sql: &'static str = Box::leak(format!("SELECT count(*) FROM t{n}").into_boxed_str());
+        let rows = get_rows(&conn, sql);
+        let expected = if n == 0 { 9 } else { 8 };
+        assert_eq!(
+            rows[0][0].as_int().unwrap(),
+            expected,
+            "table t{n} did not read back after the failed checkpoint"
+        );
+    }
+
+    // A cache that can finish the work lets the retry complete, and the data must
+    // survive the round trip through the b-tree.
+    conn.execute("PRAGMA cache_size = -65536").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("a checkpoint with a workable cache must complete after the failed attempt");
+    for n in 0..TABLES {
+        let sql: &'static str = Box::leak(format!("SELECT count(*) FROM t{n}").into_boxed_str());
+        let rows = get_rows(&conn, sql);
+        let expected = if n == 0 { 9 } else { 8 };
+        assert_eq!(
+            rows[0][0].as_int().unwrap(),
+            expected,
+            "table t{n} after retry"
+        );
+    }
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
 /// What this test checks: if one checkpoint makes a unique-index delete durable in the B-tree
 /// but fails before MVCC cleanup finishes, a later checkpoint retry must not try to delete that
 /// same unique key again.
